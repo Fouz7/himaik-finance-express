@@ -17,6 +17,15 @@ const TransactionService = {
             );
             const lastBalance = lastTransactionRes.rows.length > 0 ? parseFloat(lastTransactionRes.rows[0].balance) : 0;
 
+            if (lastBalance < parseFloat(nominal)) {
+                await client.query('ROLLBACK');
+                return {
+                    success: false,
+                    statusCode: 400,
+                    message: 'Insufficient balance. The expense exceeds the current balance.'
+                };
+            }
+
             const newBalance = lastBalance - parseFloat(nominal);
 
             const transactionQuery = `
@@ -69,10 +78,11 @@ const TransactionService = {
             const balanceAdjustment = parseFloat(txToDelete.debit);
 
             const updateQuery = `
-        UPDATE "financeschema"."transactions"
-        SET balance = balance + $1
-        WHERE "createdAt" > $2 OR ("createdAt" = $2 AND "transactionId" > $3);
-      `;
+                UPDATE "financeschema"."transactions"
+                SET balance = balance + $1
+                WHERE "createdAt" > $2
+                   OR ("createdAt" = $2 AND "transactionId" > $3);
+            `;
             await client.query(updateQuery, [balanceAdjustment, txToDelete.createdAt, transactionId]);
 
             await client.query('COMMIT');

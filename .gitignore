@@ -3,3 +3,5 @@
 .vscode
 .env
 .vercel
+node_modules
+node_modules/
