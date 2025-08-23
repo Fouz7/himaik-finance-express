@@ -30,6 +30,18 @@ const BalanceController = {
 
         res.status(result.statusCode).json(result.data);
     },
+
+    uploadBalanceEvidence: async (req, res) => {
+        const result = await BalanceService.uploadBalanceEvidence(req.file);
+        if (!result.success) return res.status(result.statusCode).json({ message: result.message });
+        res.status(result.statusCode).json(result.data);
+    },
+
+    showBalanceEvidence: async (req, res) => {
+        const result = await BalanceService.showBalanceEvidence();
+        if (!result.success) return res.status(result.statusCode).json({ message: result.message });
+        res.status(result.statusCode).json(result.data);
+    },
 };
 
 export default BalanceController;
