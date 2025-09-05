@@ -14,12 +14,12 @@ const AuthService = {
             const user = rows[0];
 
             if (!user) {
-                return {success: false, statusCode: 401, message: 'Invalid credentials.'};
+                return {success: false, statusCode: 401, message: 'User Not Found'};
             }
 
             const isMatch = await bcrypt.compare(password, user.password);
             if (!isMatch) {
-                return {success: false, statusCode: 401, message: 'Invalid credentials.'};
+                return {success: false, statusCode: 401, message: 'Password Incorrect'};
             }
 
             delete user.password;
