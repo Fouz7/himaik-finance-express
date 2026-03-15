@@ -27,6 +27,22 @@ const TransactionController = {
         res.status(result.statusCode).json({message: result.message});
     },
 
+    update: async (req, res) => {
+        const {id} = req.params;
+        const transactionData = {
+            ...req.body,
+            createdBy: req.user ? req.user.username : 'system',
+        };
+
+        const result = await TransactionService.updateTransaction(id, transactionData);
+
+        if (!result.success) {
+            return res.status(result.statusCode).json({message: result.message});
+        }
+
+        res.status(result.statusCode).json({message: result.message, data: result.data});
+    },
+
     getAll: async (req, res) => {
         const {page, limit = 10} = req.query;
         const validLimit = [5, 10].includes(parseInt(limit, 10)) ? parseInt(limit, 10) : 10;

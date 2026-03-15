@@ -52,6 +52,104 @@ const TransactionService = {
         }
     },
 
+    updateTransaction: async (transactionId, transactionData) => {
+        const {nominal, notes, createdBy} = transactionData;
+
+        if (nominal === undefined && notes === undefined && createdBy === undefined) {
+            return {
+                success: false,
+                statusCode: 400,
+                message: 'At least one field is required to update transaction.'
+            };
+        }
+
+        if (nominal !== undefined) {
+            const parsedNominal = parseFloat(nominal);
+            if (Number.isNaN(parsedNominal) || parsedNominal <= 0) {
+                return {success: false, statusCode: 400, message: 'Nominal must be a valid positive number.'};
+            }
+        }
+
+        const client = await db.getClient();
+        try {
+            await client.query('BEGIN');
+
+            const txRes = await client.query('SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
+            if (txRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return {success: false, statusCode: 404, message: 'Transaction not found.'};
+            }
+
+            const txToUpdate = txRes.rows[0];
+            if (parseFloat(txToUpdate.credit) > 0) {
+                await client.query('ROLLBACK');
+                return {
+                    success: false,
+                    statusCode: 400,
+                    message: 'Cannot update an income transaction from this endpoint. Please use the income update route.'
+                };
+            }
+
+            const oldDebit = parseFloat(txToUpdate.debit);
+            const newNominal = nominal !== undefined ? parseFloat(nominal) : oldDebit;
+            const debitDelta = newNominal - oldDebit;
+
+            const balanceBeforeTransaction = parseFloat(txToUpdate.balance) + oldDebit;
+            if (newNominal > balanceBeforeTransaction) {
+                await client.query('ROLLBACK');
+                return {
+                    success: false,
+                    statusCode: 400,
+                    message: 'Insufficient balance. The updated expense exceeds the available balance at transaction time.'
+                };
+            }
+
+            const newNotes = notes ?? txToUpdate.notes;
+            const newCreatedBy = createdBy ?? txToUpdate.createdBy;
+
+            const updatedTxRes = await client.query(
+                `
+                UPDATE "financeschema"."transactions"
+                SET debit = $1,
+                    credit = 0,
+                    balance = balance - $2,
+                    notes = $3,
+                    "createdBy" = $4
+                WHERE "transactionId" = $5
+                RETURNING *;
+                `,
+                [newNominal, debitDelta, newNotes, newCreatedBy, transactionId]
+            );
+
+            if (debitDelta !== 0) {
+                await client.query(
+                    `
+                    UPDATE "financeschema"."transactions"
+                    SET balance = balance - $1
+                    WHERE "createdAt" > $2
+                       OR ("createdAt" = $2 AND "transactionId" > $3);
+                    `,
+                    [debitDelta, txToUpdate.createdAt, txToUpdate.transactionId]
+                );
+            }
+
+            await client.query('COMMIT');
+            return {
+                success: true,
+                statusCode: 200,
+                message: 'Transaction updated and balance recalculated successfully.',
+                data: updatedTxRes.rows[0],
+            };
+
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('Error during update transaction service:', error);
+            return {success: false, statusCode: 500, message: 'Server error while updating transaction.'};
+        } finally {
+            client.release();
+        }
+    },
+
     deleteTransaction: async (transactionId) => {
         const client = await db.getClient();
         try {
