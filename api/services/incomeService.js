@@ -187,7 +187,7 @@ const IncomeService = {
             }
 
             const txRes = await client.query(
-                'SELECT "transactionId", "createdAt", credit, debit FROM "financeschema"."transactions" WHERE "transactionId" = $1',
+                'SELECT "transactionId", "createdAt", credit, debit FROM "financeschema"."transactions" WHERE "transactionId" = $1 FOR UPDATE',
                 [transactionId]
             );
 
@@ -205,6 +205,31 @@ const IncomeService = {
             const creditAmount = parseFloat(txToDelete.credit) || 0;
             const debitAmount = parseFloat(txToDelete.debit) || 0;
             const balanceAdjustment = debitAmount - creditAmount;
+
+            const impactedRowsRes = await client.query(
+                `
+                SELECT "transactionId", balance
+                FROM "financeschema"."transactions"
+                WHERE "createdAt" > $1
+                   OR ("createdAt" = $1 AND "transactionId" > $2)
+                FOR UPDATE;
+                `,
+                [txToDelete.createdAt, transactionId]
+            );
+
+            const willCauseNegativeBalance = impactedRowsRes.rows.some((row) => {
+                const currentBalance = parseFloat(row.balance) || 0;
+                return currentBalance + balanceAdjustment < 0;
+            });
+
+            if (willCauseNegativeBalance) {
+                await client.query('ROLLBACK');
+                return {
+                    success: false,
+                    statusCode: 400,
+                    message: 'Cannot delete income because the balance is insufficient.'
+                };
+            }
 
             await client.query('DELETE FROM "financeschema"."incomedata" WHERE id = $1', [incomeId]);
             await client.query('DELETE FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);

@@ -74,7 +74,10 @@ const TransactionService = {
         try {
             await client.query('BEGIN');
 
-            const txRes = await client.query('SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
+            const txRes = await client.query(
+                'SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1 FOR UPDATE',
+                [transactionId]
+            );
             if (txRes.rows.length === 0) {
                 await client.query('ROLLBACK');
                 return {success: false, statusCode: 404, message: 'Transaction not found.'};
@@ -215,7 +218,10 @@ const TransactionService = {
         try {
             await client.query('BEGIN');
 
-            const txRes = await client.query('SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
+            const txRes = await client.query(
+                'SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1 FOR UPDATE',
+                [transactionId]
+            );
             if (txRes.rows.length === 0) {
                 await client.query('ROLLBACK');
                 return {success: false, statusCode: 404, message: 'Transaction not found.'};
@@ -224,6 +230,34 @@ const TransactionService = {
 
             const creditAmount = parseFloat(txToDelete.credit) || 0;
             const debitAmount = parseFloat(txToDelete.debit) || 0;
+            const balanceAdjustment = debitAmount - creditAmount;
+
+            if (creditAmount > 0) {
+                const impactedRowsRes = await client.query(
+                    `
+                    SELECT "transactionId", balance
+                    FROM "financeschema"."transactions"
+                    WHERE "createdAt" > $1
+                       OR ("createdAt" = $1 AND "transactionId" > $2)
+                    FOR UPDATE;
+                    `,
+                    [txToDelete.createdAt, transactionId]
+                );
+
+                const willCauseNegativeBalance = impactedRowsRes.rows.some((row) => {
+                    const currentBalance = parseFloat(row.balance) || 0;
+                    return currentBalance + balanceAdjustment < 0;
+                });
+
+                if (willCauseNegativeBalance) {
+                    await client.query('ROLLBACK');
+                    return {
+                        success: false,
+                        statusCode: 400,
+                        message: 'Cannot delete income transaction because the balance is insufficient.'
+                    };
+                }
+            }
 
             if (creditAmount > 0) {
                 await client.query(
@@ -234,7 +268,6 @@ const TransactionService = {
 
             await client.query('DELETE FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
 
-            const balanceAdjustment = debitAmount - creditAmount;
 
             const updateQuery = `
                 UPDATE "financeschema"."transactions"

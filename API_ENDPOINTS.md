@@ -296,6 +296,9 @@ atau
 ### DELETE `/incomes/:id`
 Hapus income dan transaksi yang terhubung (`transactionId`) sekaligus, lalu rekalkulasi balance transaksi sesudahnya.
 
+Proteksi saldo:
+- Penghapusan akan ditolak jika setelah rekalkulasi ada transaksi setelahnya yang menjadi minus.
+
 - Auth: `Yes`
 - Path Param:
   - `id` (income id)
@@ -326,6 +329,14 @@ Jika data income ada tapi transaksi referensinya sudah tidak ada:
 ```json
 {
   "message": "Cannot delete income without a linked transaction."
+}
+```
+
+atau
+
+```json
+{
+  "message": "Cannot delete income because the balance is insufficient."
 }
 ```
 
@@ -565,6 +576,7 @@ Perilaku baru:
 - Jika transaksi adalah expense, hanya transaksi itu yang dihapus.
 - Jika transaksi adalah income (`credit > 0`), data income terkait di `incomedata` juga ikut dihapus.
 - Setelah penghapusan, balance transaksi setelahnya otomatis direkalkulasi.
+- Jika transaksi adalah income dan penghapusan membuat saldo transaksi setelahnya menjadi minus, request akan ditolak.
 
 - Auth: `Yes`
 - Path Param:
@@ -582,6 +594,14 @@ Tidak ada.
 ```
 
 #### Error Responses
+
+- 400
+
+```json
+{
+  "message": "Cannot delete income transaction because the balance is insufficient."
+}
+```
 
 - 404
 
