@@ -1,4 +1,10 @@
 import db from '../config/db.js';
+import {
+    lockTransactionLedger,
+    recalculateTransactionBalances,
+    willDeleteTransactionCauseInsufficientBalance,
+    willUpdateTransactionCauseInsufficientBalance,
+} from './ledgerService.js';
 
 const TransactionService = {
     addExpense: async (expenseData) => {
@@ -11,6 +17,7 @@ const TransactionService = {
         const client = await db.getClient();
         try {
             await client.query('BEGIN');
+            await lockTransactionLedger(client);
 
             const lastTransactionRes = await client.query(
                 'SELECT balance FROM "financeschema"."transactions" ORDER BY "createdAt" DESC, "transactionId" DESC LIMIT 1'
@@ -34,6 +41,8 @@ const TransactionService = {
             `;
             const transactionValues = [nominal, 0, newBalance, notes, createdBy];
             const newTransaction = await client.query(transactionQuery, transactionValues);
+
+            await recalculateTransactionBalances(client);
 
             await client.query('COMMIT');
 
@@ -73,6 +82,7 @@ const TransactionService = {
         const client = await db.getClient();
         try {
             await client.query('BEGIN');
+            await lockTransactionLedger(client);
 
             const txRes = await client.query(
                 'SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1 FOR UPDATE',
@@ -98,7 +108,21 @@ const TransactionService = {
                 const linkedIncome = incomeRes.rows[0];
                 const oldCredit = parseFloat(txToUpdate.credit);
                 const newNominal = nominal !== undefined ? parseFloat(nominal) : oldCredit;
-                const nominalDelta = newNominal - oldCredit;
+
+                const causesInsufficientBalance = await willUpdateTransactionCauseInsufficientBalance(
+                    client,
+                    transactionId,
+                    newNominal,
+                    0
+                );
+                if (causesInsufficientBalance) {
+                    await client.query('ROLLBACK');
+                    return {
+                        success: false,
+                        statusCode: 400,
+                        message: 'Cannot update income transaction because the balance is insufficient.'
+                    };
+                }
 
                 const incomeNameFromNotes = notes !== undefined
                     ? notes.replace(/^Income:\s*/i, '').trim()
@@ -123,26 +147,15 @@ const TransactionService = {
                     UPDATE "financeschema"."transactions"
                     SET credit = $1,
                         debit = 0,
-                        balance = balance + $2,
-                        notes = $3,
-                        "createdBy" = $4
-                    WHERE "transactionId" = $5
+                        notes = $2,
+                        "createdBy" = $3
+                    WHERE "transactionId" = $4
                     RETURNING *;
                     `,
-                    [newNominal, nominalDelta, `Income: ${newIncomeName}`, newCreatedBy, transactionId]
+                    [newNominal, `Income: ${newIncomeName}`, newCreatedBy, transactionId]
                 );
 
-                if (nominalDelta !== 0) {
-                    await client.query(
-                        `
-                        UPDATE "financeschema"."transactions"
-                        SET balance = balance + $1
-                        WHERE "createdAt" > $2
-                           OR ("createdAt" = $2 AND "transactionId" > $3);
-                        `,
-                        [nominalDelta, txToUpdate.createdAt, txToUpdate.transactionId]
-                    );
-                }
+                await recalculateTransactionBalances(client);
 
                 await client.query('COMMIT');
                 return {
@@ -155,10 +168,14 @@ const TransactionService = {
 
             const oldDebit = parseFloat(txToUpdate.debit);
             const newNominal = nominal !== undefined ? parseFloat(nominal) : oldDebit;
-            const debitDelta = newNominal - oldDebit;
 
-            const balanceBeforeTransaction = parseFloat(txToUpdate.balance) + oldDebit;
-            if (newNominal > balanceBeforeTransaction) {
+            const causesInsufficientBalance = await willUpdateTransactionCauseInsufficientBalance(
+                client,
+                transactionId,
+                0,
+                newNominal
+            );
+            if (causesInsufficientBalance) {
                 await client.query('ROLLBACK');
                 return {
                     success: false,
@@ -175,26 +192,15 @@ const TransactionService = {
                 UPDATE "financeschema"."transactions"
                 SET debit = $1,
                     credit = 0,
-                    balance = balance - $2,
-                    notes = $3,
-                    "createdBy" = $4
-                WHERE "transactionId" = $5
+                    notes = $2,
+                    "createdBy" = $3
+                WHERE "transactionId" = $4
                 RETURNING *;
                 `,
-                [newNominal, debitDelta, newNotes, newCreatedBy, transactionId]
+                [newNominal, newNotes, newCreatedBy, transactionId]
             );
 
-            if (debitDelta !== 0) {
-                await client.query(
-                    `
-                    UPDATE "financeschema"."transactions"
-                    SET balance = balance - $1
-                    WHERE "createdAt" > $2
-                       OR ("createdAt" = $2 AND "transactionId" > $3);
-                    `,
-                    [debitDelta, txToUpdate.createdAt, txToUpdate.transactionId]
-                );
-            }
+            await recalculateTransactionBalances(client);
 
             await client.query('COMMIT');
             return {
@@ -217,6 +223,7 @@ const TransactionService = {
         const client = await db.getClient();
         try {
             await client.query('BEGIN');
+            await lockTransactionLedger(client);
 
             const txRes = await client.query(
                 'SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1 FOR UPDATE',
@@ -229,27 +236,11 @@ const TransactionService = {
             const txToDelete = txRes.rows[0];
 
             const creditAmount = parseFloat(txToDelete.credit) || 0;
-            const debitAmount = parseFloat(txToDelete.debit) || 0;
-            const balanceAdjustment = debitAmount - creditAmount;
 
             if (creditAmount > 0) {
-                const impactedRowsRes = await client.query(
-                    `
-                    SELECT "transactionId", balance
-                    FROM "financeschema"."transactions"
-                    WHERE "createdAt" > $1
-                       OR ("createdAt" = $1 AND "transactionId" > $2)
-                    FOR UPDATE;
-                    `,
-                    [txToDelete.createdAt, transactionId]
-                );
+                const willCauseInsufficientBalance = await willDeleteTransactionCauseInsufficientBalance(client, transactionId);
 
-                const willCauseNegativeBalance = impactedRowsRes.rows.some((row) => {
-                    const currentBalance = parseFloat(row.balance) || 0;
-                    return currentBalance + balanceAdjustment < 0;
-                });
-
-                if (willCauseNegativeBalance) {
+                if (willCauseInsufficientBalance) {
                     await client.query('ROLLBACK');
                     return {
                         success: false,
@@ -268,14 +259,7 @@ const TransactionService = {
 
             await client.query('DELETE FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
 
-
-            const updateQuery = `
-                UPDATE "financeschema"."transactions"
-                SET balance = balance + $1
-                WHERE "createdAt" > $2
-                   OR ("createdAt" = $2 AND "transactionId" > $3);
-            `;
-            await client.query(updateQuery, [balanceAdjustment, txToDelete.createdAt, transactionId]);
+            await recalculateTransactionBalances(client);
 
             await client.query('COMMIT');
             return {

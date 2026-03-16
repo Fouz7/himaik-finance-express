@@ -1,4 +1,10 @@
 import db from '../config/db.js';
+import {
+    lockTransactionLedger,
+    recalculateTransactionBalances,
+    willDeleteTransactionCauseInsufficientBalance,
+    willUpdateTransactionCauseInsufficientBalance,
+} from './ledgerService.js';
 
 const IncomeService = {
     addIncome: async (incomeData) => {
@@ -16,6 +22,7 @@ const IncomeService = {
 
         try {
             await client.query('BEGIN');
+            await lockTransactionLedger(client);
 
             const lastTransactionRes = await client.query(
                 'SELECT balance FROM "financeschema"."transactions" ORDER BY "createdAt" DESC, "transactionId" DESC LIMIT 1'
@@ -42,6 +49,8 @@ const IncomeService = {
                 'UPDATE "financeschema"."incomedata" SET "transactionId" = $1 WHERE id = $2',
                 [newTransaction.rows[0].transactionId, newIncome.rows[0].id]
             );
+
+            await recalculateTransactionBalances(client);
 
             await client.query('COMMIT');
 
@@ -81,8 +90,9 @@ const IncomeService = {
         const client = await db.getClient();
         try {
             await client.query('BEGIN');
+            await lockTransactionLedger(client);
 
-            const incomeRes = await client.query('SELECT * FROM "financeschema"."incomedata" WHERE id = $1', [incomeId]);
+            const incomeRes = await client.query('SELECT * FROM "financeschema"."incomedata" WHERE id = $1 FOR UPDATE', [incomeId]);
             if (incomeRes.rows.length === 0) {
                 await client.query('ROLLBACK');
                 return {success: false, statusCode: 404, message: 'Income not found.'};
@@ -95,7 +105,7 @@ const IncomeService = {
             }
 
             const txRes = await client.query(
-                'SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1',
+                'SELECT * FROM "financeschema"."transactions" WHERE "transactionId" = $1 FOR UPDATE',
                 [incomeToUpdate.transactionId]
             );
             if (txRes.rows.length === 0) {
@@ -111,7 +121,21 @@ const IncomeService = {
 
             const oldNominal = parseFloat(incomeToUpdate.nominal);
             const newNominal = nominal !== undefined ? parseFloat(nominal) : oldNominal;
-            const nominalDelta = newNominal - oldNominal;
+
+            const causesInsufficientBalance = await willUpdateTransactionCauseInsufficientBalance(
+                client,
+                incomeToUpdate.transactionId,
+                newNominal,
+                0
+            );
+            if (causesInsufficientBalance) {
+                await client.query('ROLLBACK');
+                return {
+                    success: false,
+                    statusCode: 400,
+                    message: 'Cannot update income because the balance is insufficient.'
+                };
+            }
 
             const newName = name ?? incomeToUpdate.name;
             const newTransferDate = transfer_date ?? incomeToUpdate.transfer_date;
@@ -132,25 +156,14 @@ const IncomeService = {
                 UPDATE "financeschema"."transactions"
                 SET credit = $1,
                     debit = 0,
-                    balance = balance + $2,
-                    notes = $3,
-                    "createdBy" = $4
-                WHERE "transactionId" = $5;
+                    notes = $2,
+                    "createdBy" = $3
+                WHERE "transactionId" = $4;
                 `,
-                [newNominal, nominalDelta, `Income: ${newName}`, newCreatedBy, incomeToUpdate.transactionId]
+                [newNominal, `Income: ${newName}`, newCreatedBy, incomeToUpdate.transactionId]
             );
 
-            if (nominalDelta !== 0) {
-                await client.query(
-                    `
-                    UPDATE "financeschema"."transactions"
-                    SET balance = balance + $1
-                    WHERE "createdAt" > $2
-                       OR ("createdAt" = $2 AND "transactionId" > $3);
-                    `,
-                    [nominalDelta, linkedTx.createdAt, linkedTx.transactionId]
-                );
-            }
+            await recalculateTransactionBalances(client);
 
             await client.query('COMMIT');
             return {
@@ -172,8 +185,9 @@ const IncomeService = {
         const client = await db.getClient();
         try {
             await client.query('BEGIN');
+            await lockTransactionLedger(client);
 
-            const incomeRes = await client.query('SELECT * FROM "financeschema"."incomedata" WHERE id = $1', [incomeId]);
+            const incomeRes = await client.query('SELECT * FROM "financeschema"."incomedata" WHERE id = $1 FOR UPDATE', [incomeId]);
             if (incomeRes.rows.length === 0) {
                 await client.query('ROLLBACK');
                 return {success: false, statusCode: 404, message: 'Income not found.'};
@@ -201,28 +215,8 @@ const IncomeService = {
                 };
             }
 
-            const txToDelete = txRes.rows[0];
-            const creditAmount = parseFloat(txToDelete.credit) || 0;
-            const debitAmount = parseFloat(txToDelete.debit) || 0;
-            const balanceAdjustment = debitAmount - creditAmount;
-
-            const impactedRowsRes = await client.query(
-                `
-                SELECT "transactionId", balance
-                FROM "financeschema"."transactions"
-                WHERE "createdAt" > $1
-                   OR ("createdAt" = $1 AND "transactionId" > $2)
-                FOR UPDATE;
-                `,
-                [txToDelete.createdAt, transactionId]
-            );
-
-            const willCauseNegativeBalance = impactedRowsRes.rows.some((row) => {
-                const currentBalance = parseFloat(row.balance) || 0;
-                return currentBalance + balanceAdjustment < 0;
-            });
-
-            if (willCauseNegativeBalance) {
+            const willCauseInsufficientBalance = await willDeleteTransactionCauseInsufficientBalance(client, transactionId);
+            if (willCauseInsufficientBalance) {
                 await client.query('ROLLBACK');
                 return {
                     success: false,
@@ -234,13 +228,7 @@ const IncomeService = {
             await client.query('DELETE FROM "financeschema"."incomedata" WHERE id = $1', [incomeId]);
             await client.query('DELETE FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
 
-            const updateQuery = `
-                UPDATE "financeschema"."transactions"
-                SET balance = balance + $1
-                WHERE "createdAt" > $2
-                   OR ("createdAt" = $2 AND "transactionId" > $3);
-            `;
-            await client.query(updateQuery, [balanceAdjustment, txToDelete.createdAt, transactionId]);
+            await recalculateTransactionBalances(client);
 
             await client.query('COMMIT');
             return {

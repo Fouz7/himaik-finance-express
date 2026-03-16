@@ -269,6 +269,14 @@ atau
 }
 ```
 
+atau
+
+```json
+{
+  "message": "Cannot update income because the balance is insufficient."
+}
+```
+
 - 404
 
 ```json
@@ -551,6 +559,14 @@ atau
 {
   "message": "Linked income not found for this transaction."
 }
+
+atau
+
+```json
+{
+  "message": "Cannot update income transaction because the balance is insufficient."
+}
+```
 ```
 
 - 404

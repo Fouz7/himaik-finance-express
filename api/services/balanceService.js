@@ -9,9 +9,8 @@ const BalanceService = {
     getCurrentBalance: async () => {
         try {
             const query = `
-                SELECT balance
+                SELECT COALESCE(SUM(credit - debit), 0) AS balance
                 FROM "financeschema"."transactions"
-                ORDER BY "createdAt" DESC, "transactionId" DESC LIMIT 1;
             `;
             const result = await db.query(query);
 
