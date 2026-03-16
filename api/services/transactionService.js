@@ -82,11 +82,71 @@ const TransactionService = {
 
             const txToUpdate = txRes.rows[0];
             if (parseFloat(txToUpdate.credit) > 0) {
-                await client.query('ROLLBACK');
+                const incomeRes = await client.query(
+                    'SELECT * FROM "financeschema"."incomedata" WHERE "transactionId" = $1',
+                    [transactionId]
+                );
+
+                if (incomeRes.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return {success: false, statusCode: 404, message: 'Linked income not found for this transaction.'};
+                }
+
+                const linkedIncome = incomeRes.rows[0];
+                const oldCredit = parseFloat(txToUpdate.credit);
+                const newNominal = nominal !== undefined ? parseFloat(nominal) : oldCredit;
+                const nominalDelta = newNominal - oldCredit;
+
+                const incomeNameFromNotes = notes !== undefined
+                    ? notes.replace(/^Income:\s*/i, '').trim()
+                    : linkedIncome.name;
+                const newIncomeName = incomeNameFromNotes || linkedIncome.name;
+                const newCreatedBy = createdBy ?? txToUpdate.createdBy;
+
+                await client.query(
+                    `
+                    UPDATE "financeschema"."incomedata"
+                    SET name = $1,
+                        nominal = $2,
+                        transfer_date = $3,
+                        "createdBy" = $4
+                    WHERE id = $5;
+                    `,
+                    [newIncomeName, newNominal, linkedIncome.transfer_date, newCreatedBy, linkedIncome.id]
+                );
+
+                const updatedTxRes = await client.query(
+                    `
+                    UPDATE "financeschema"."transactions"
+                    SET credit = $1,
+                        debit = 0,
+                        balance = balance + $2,
+                        notes = $3,
+                        "createdBy" = $4
+                    WHERE "transactionId" = $5
+                    RETURNING *;
+                    `,
+                    [newNominal, nominalDelta, `Income: ${newIncomeName}`, newCreatedBy, transactionId]
+                );
+
+                if (nominalDelta !== 0) {
+                    await client.query(
+                        `
+                        UPDATE "financeschema"."transactions"
+                        SET balance = balance + $1
+                        WHERE "createdAt" > $2
+                           OR ("createdAt" = $2 AND "transactionId" > $3);
+                        `,
+                        [nominalDelta, txToUpdate.createdAt, txToUpdate.transactionId]
+                    );
+                }
+
+                await client.query('COMMIT');
                 return {
-                    success: false,
-                    statusCode: 400,
-                    message: 'Cannot update an income transaction from this endpoint. Please use the income update route.'
+                    success: true,
+                    statusCode: 200,
+                    message: 'Income transaction and linked income updated successfully.',
+                    data: updatedTxRes.rows[0],
                 };
             }
 
@@ -162,18 +222,19 @@ const TransactionService = {
             }
             const txToDelete = txRes.rows[0];
 
-            if (parseFloat(txToDelete.credit) > 0) {
-                await client.query('ROLLBACK');
-                return {
-                    success: false,
-                    statusCode: 400,
-                    message: 'Cannot delete an income transaction from this endpoint. Please use the income deletion route.'
-                };
+            const creditAmount = parseFloat(txToDelete.credit) || 0;
+            const debitAmount = parseFloat(txToDelete.debit) || 0;
+
+            if (creditAmount > 0) {
+                await client.query(
+                    'DELETE FROM "financeschema"."incomedata" WHERE "transactionId" = $1',
+                    [transactionId]
+                );
             }
 
             await client.query('DELETE FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
 
-            const balanceAdjustment = parseFloat(txToDelete.debit);
+            const balanceAdjustment = debitAmount - creditAmount;
 
             const updateQuery = `
                 UPDATE "financeschema"."transactions"
@@ -187,7 +248,7 @@ const TransactionService = {
             return {
                 success: true,
                 statusCode: 200,
-                message: 'Transaction deleted and balance recalculated successfully.'
+                message: 'Transaction deleted and related data recalculated successfully.'
             };
 
         } catch (error) {

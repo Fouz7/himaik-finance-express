@@ -179,29 +179,50 @@ const IncomeService = {
                 return {success: false, statusCode: 404, message: 'Income not found.'};
             }
             const incomeToDelete = incomeRes.rows[0];
-            const {nominal, transactionId} = incomeToDelete;
+            const {transactionId} = incomeToDelete;
 
             if (!transactionId) {
                 await client.query('ROLLBACK');
                 return {success: false, statusCode: 400, message: 'Cannot delete income without a linked transaction.'};
             }
 
-            const txRes = await client.query('SELECT "createdAt" FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
-            const deletedTxCreatedAt = txRes.rows[0].createdAt;
+            const txRes = await client.query(
+                'SELECT "transactionId", "createdAt", credit, debit FROM "financeschema"."transactions" WHERE "transactionId" = $1',
+                [transactionId]
+            );
+
+            if (txRes.rows.length === 0) {
+                await client.query('DELETE FROM "financeschema"."incomedata" WHERE id = $1', [incomeId]);
+                await client.query('COMMIT');
+                return {
+                    success: true,
+                    statusCode: 200,
+                    message: 'Income deleted successfully. Linked transaction was not found.'
+                };
+            }
+
+            const txToDelete = txRes.rows[0];
+            const creditAmount = parseFloat(txToDelete.credit) || 0;
+            const debitAmount = parseFloat(txToDelete.debit) || 0;
+            const balanceAdjustment = debitAmount - creditAmount;
 
             await client.query('DELETE FROM "financeschema"."incomedata" WHERE id = $1', [incomeId]);
             await client.query('DELETE FROM "financeschema"."transactions" WHERE "transactionId" = $1', [transactionId]);
 
             const updateQuery = `
                 UPDATE "financeschema"."transactions"
-                SET balance = balance - $1
+                SET balance = balance + $1
                 WHERE "createdAt" > $2
                    OR ("createdAt" = $2 AND "transactionId" > $3);
             `;
-            await client.query(updateQuery, [nominal, deletedTxCreatedAt, transactionId]);
+            await client.query(updateQuery, [balanceAdjustment, txToDelete.createdAt, transactionId]);
 
             await client.query('COMMIT');
-            return {success: true, statusCode: 200, message: 'Income deleted and balance recalculated successfully.'};
+            return {
+                success: true,
+                statusCode: 200,
+                message: 'Income and linked transaction deleted with recalculated balances successfully.'
+            };
 
         } catch (error) {
             await client.query('ROLLBACK');
